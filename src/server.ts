@@ -191,14 +191,18 @@ function maybeStripAnswerTags(text: string): string {
 function ensureWorkspaceDir(dirPath: string | null | undefined): void {
   const resolved = (dirPath ?? "").trim();
   if (!resolved) return;
-  if (existsSync(resolved)) {
-    const stat = statSync(resolved);
-    if (!stat.isDirectory()) {
-      throw new Error(`Workspace path is not a directory: ${resolved}`);
+  try {
+    mkdirSync(resolved, { recursive: true });
+  } catch (e: unknown) {
+    if ((e as NodeJS.ErrnoException).code === "EEXIST") {
+      const stat = statSync(resolved);
+      if (!stat.isDirectory()) {
+        throw new Error(`Workspace path is not a directory: ${resolved}`);
+      }
+      return; // already exists and is a directory
     }
-    return;
+    throw e;
   }
-  mkdirSync(resolved, { recursive: true });
 }
 
 function openaiError(message: string, statusCode = 500): Response {
@@ -1120,6 +1124,7 @@ async function handleChatCompletions(
     }
 
     // ─── Streaming path ─────────────────────────────────────────────────────
+    const clientSignal = _c?.req?.raw?.signal; // cancel subprocess on client disconnect
     const keepaliveSec = Math.max(settings.sse_keepalive_seconds, 0);
     const encoder = new TextEncoder();
 
@@ -1244,7 +1249,7 @@ async function handleChatCompletions(
                 if (cursorModel) cmd.push("--model", cursorModel);
                 if (settings.cursor_agent_stream_partial_output) cmd.push("--stream-partial-output");
                 const { cmd: cursorFinalCmd, stdinData: cursorStdinData } = buildCursorAgentCmd(cmd, prompt);
-                events = iterStreamJsonEvents({ cmd: cursorFinalCmd, timeoutMs: settings.timeout_seconds * 1000, totalTimeoutMs: settings.timeout_seconds * 1000, killOnResult: true, stdinData: cursorStdinData });
+                events = iterStreamJsonEvents({ cmd: cursorFinalCmd, timeoutMs: settings.timeout_seconds * 1000, totalTimeoutMs: settings.timeout_seconds * 1000, killOnResult: true, stdinData: cursorStdinData, signal: clientSignal });
               } else if (provider === "claude") {
                 const claudeModel = effectiveProviderModel ?? settings.claude_model ?? "sonnet";
                 if (useClaudeOauth) {
@@ -1264,7 +1269,7 @@ async function handleChatCompletions(
                   ];
                   if (claudeModel) cmd.push("--model", claudeModel);
                   cmd.push("--", prompt);
-                  events = iterStreamJsonEvents({ cmd, timeoutMs: settings.timeout_seconds * 1000 });
+                  events = iterStreamJsonEvents({ cmd, timeoutMs: settings.timeout_seconds * 1000, signal: clientSignal });
                 }
               } else if (provider === "gemini") {
                 const geminiModel = effectiveProviderModel ?? settings.gemini_model ?? "gemini-3-flash-preview";
@@ -1280,7 +1285,7 @@ async function handleChatCompletions(
                   const cmd = [settings.gemini_bin, "-o", "stream-json"];
                   if (geminiModel) cmd.push("-m", geminiModel);
                   cmd.push(prompt);
-                  events = iterStreamJsonEvents({ cmd, timeoutMs: settings.timeout_seconds * 1000 });
+                  events = iterStreamJsonEvents({ cmd, timeoutMs: settings.timeout_seconds * 1000, signal: clientSignal });
                 }
               } else {
                 throw new Error(`Unknown provider: ${provider}`);

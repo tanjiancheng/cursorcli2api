@@ -61,6 +61,8 @@ export interface IterStreamJsonEventsOptions {
   killOnResult?: boolean;
   /** Data to write to the subprocess stdin before closing it. */
   stdinData?: string | null;
+  /** AbortSignal to cancel the subprocess (e.g. client disconnect). */
+  signal?: AbortSignal;
   eventCallback?: (evt: Record<string, unknown>) => void;
   stderrCallback?: (line: string) => void;
 }
@@ -79,6 +81,7 @@ export async function* iterStreamJsonEvents(
     totalTimeoutMs,
     killOnResult = false,
     stdinData = null,
+    signal,
     eventCallback,
     stderrCallback,
   } = opts;
@@ -93,13 +96,21 @@ export async function* iterStreamJsonEvents(
     proc.stdin.end();
   }
 
+  // AbortSignal: check immediately-aborted, defer listener until rl is created
+  if (signal) {
+    if (signal.aborted) {
+      proc.kill("SIGKILL");
+      throw new Error("aborted");
+    }
+  }
+
   const stderrBuf: Buffer[] = [];
   let lastHint: string | null = null;
   let totalTimedOut = false;
   const totalTimer = totalTimeoutMs
     ? setTimeout(() => {
         totalTimedOut = true;
-        proc.kill();
+        proc.kill("SIGKILL");
       }, totalTimeoutMs)
     : null;
 
@@ -139,41 +150,54 @@ export async function* iterStreamJsonEvents(
 
   const drainPromise = drainStderr();
 
+  let rl: ReturnType<typeof createInterface> | null = null;
+
   try {
     if (!proc.stdout) {
       throw new Error('subprocess stdout not available');
     }
 
-    const rl = createInterface({
+    rl = createInterface({
       input: proc.stdout as Readable,
       crlfDelay: Infinity,
     });
 
+    // Register abort listener now that rl is assigned
+    if (signal && !signal.aborted) {
+      const onAbort = () => {
+        rl?.close();
+        proc.kill("SIGKILL");
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+    }
+
+    const iface = rl; // non-null: assigned above, only reached inside try block
+
     const nextLine = (): Promise<string | null> =>
       new Promise((resolve, reject) => {
         const timer = setTimeout(() => {
-          rl.removeListener('line', onLine);
-          rl.removeListener('close', onClose);
-          proc.kill();
+          iface.removeListener('line', onLine);
+          iface.removeListener('close', onClose);
+          proc.kill("SIGKILL");
           reject(new Error(`subprocess timeout after ${timeoutMs}ms`));
         }, timeoutMs);
 
         const onLine = (line: string) => {
           clearTimeout(timer);
-          rl.removeListener('line', onLine);
-          rl.removeListener('close', onClose);
+          iface.removeListener('line', onLine);
+          iface.removeListener('close', onClose);
           resolve(line);
         };
 
         const onClose = () => {
           clearTimeout(timer);
-          rl.removeListener('line', onLine);
-          rl.removeListener('close', onClose);
+          iface.removeListener('line', onLine);
+          iface.removeListener('close', onClose);
           resolve(null);
         };
 
-        rl.once('line', onLine);
-        rl.once('close', onClose);
+        iface.once('line', onLine);
+        iface.once('close', onClose);
       });
 
     while (true) {
@@ -213,8 +237,7 @@ export async function* iterStreamJsonEvents(
       yield evt;
 
       if (killOnResult && evt.type === 'result') {
-        proc.kill();
-        await drainPromise;
+        proc.kill("SIGKILL");
         return;
       }
     }
@@ -225,7 +248,8 @@ export async function* iterStreamJsonEvents(
       const finish = (code: number | null) => {
         if (code !== 0) {
           const msg = Buffer.concat(stderrBuf).toString('utf8').trim();
-          reject(new Error(msg || lastHint || `subprocess failed: ${code}`));
+          const exitInfo = code != null ? `${code}` : `signal ${proc.signalCode ?? "unknown"}`;
+          reject(new Error(msg || lastHint || `subprocess failed: ${exitInfo}`));
         } else {
           resolve();
         }
@@ -238,9 +262,11 @@ export async function* iterStreamJsonEvents(
     });
   } finally {
     if (totalTimer) clearTimeout(totalTimer);
-    if (proc.exitCode === null) {
-      proc.kill();
-      await new Promise<void>((r) => proc.once('exit', () => r()));
+    rl?.close();
+    // exitCode is null for signal-killed processes, so also check signalCode
+    if (proc.exitCode === null && proc.signalCode === null) {
+      proc.kill("SIGKILL");
+      await new Promise<void>((r) => proc.once("exit", () => r()));
     }
   }
 }

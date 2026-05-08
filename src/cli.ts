@@ -227,9 +227,18 @@ async function main(): Promise<void> {
     console.error("[agent-cli-to-api] clientError:", err);
   });
 
-  process.on("SIGTERM", async () => {
+  const gracefulShutdown = async () => {
+    console.error("[agent-cli-to-api] shutting down...");
+    server.close(); // stop accepting new connections
     await onShutdown();
-    process.exit(0);
+    console.error("[agent-cli-to-api] shutdown complete");
+  };
+
+  process.on("SIGTERM", () => {
+    gracefulShutdown().then(() => process.exit(0));
+  });
+  process.on("SIGINT", () => {
+    gracefulShutdown().then(() => process.exit(0));
   });
 }
 
