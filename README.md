@@ -31,6 +31,8 @@
 - **Anthropic 兼容** — `POST /v1/messages`（流式和非流式）
 - **多 Provider** — Cursor Agent、Codex、Claude Code、Gemini CLI
 - **SSE 流式** — token 级流式输出，含 keepalive 心跳
+- **客户端断连取消** — 客户端断开时自动终止子进程，不浪费资源
+- **优雅关闭** — SIGTERM/SIGINT 时 clean shutdown，不留僵尸进程
 - **Tool Call** — Cursor Agent 通过提示工程实现标准 function calling
 - **OAuth 直连** — Claude OAuth API、Gemini Cloud Code API
 - **并发控制** — 可配置最大并发数
@@ -93,34 +95,32 @@ npm start
 # 健康检查
 curl http://127.0.0.1:8000/healthz
 
-# 对话
-curl http://127.0.0.1:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer sk-your-key" \
-  -d '{"model":"auto","messages":[{"role":"user","content":"你好"}]}'
+# 单元测试
+npm test
+```
 
-# 流式
+服务启动后可通过 `Ctrl+C` 优雅关闭 — 停止接受新请求后等待活跃请求完成，然后清理连接池退出。
+```
+
+## 流式 vs 非流式
+
+**推荐默认使用非流式（`stream: false`）**，尤其是代理 Claude Code 时：
+
+- **非流式**：代码路径最短，子进程 → 收集输出 → 返回 JSON，稳定性最高
+- **流式**：中间多了一层 pump + queue，复杂度更高。适合聊天 UI 需要逐字显示的场景
+
+Claude Code CLI 本身启动较慢，非流式多等几秒对总耗时影响很小，不建议为这点时间差承担流式路径的额外风险。
+
+```bash
+# 推荐：非流式
+curl -X POST http://127.0.0.1:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"claude:sonnet","messages":[{"role":"user","content":"你好"}],"stream":false}'
+
+# 按需：流式
 curl -N http://127.0.0.1:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer sk-your-key" \
-  -d '{"model":"auto","stream":true,"messages":[{"role":"user","content":"你好"}]}'
-
-# Tool Call
-curl http://127.0.0.1:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer sk-your-key" \
-  -d '{
-    "model":"auto",
-    "messages":[{"role":"user","content":"北京今天天气如何？"}],
-    "tools":[{
-      "type":"function",
-      "function":{
-        "name":"get_weather",
-        "description":"获取天气",
-        "parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}
-      }
-    }]
-  }'
+  -d '{"model":"claude:sonnet","messages":[{"role":"user","content":"你好"}],"stream":true}'
 ```
 
 ## API 端点
@@ -309,6 +309,10 @@ cursorcli2api/
 │   │   ├── claude-oauth.ts     # Claude OAuth
 │   │   └── gemini-cloudcode.ts # Gemini Cloud Code
 │   └── codex_instructions/     # 系统指令模板
+├── tests/
+│   ├── openai-compat.test.ts    # OpenAI 兼容层测试
+│   ├── claude-oauth.test.ts     # Claude OAuth 测试
+│   └── stream-json-cli.test.ts  # 子进程生命周期测试
 └── dist/                       # 编译输出
 ```
 
