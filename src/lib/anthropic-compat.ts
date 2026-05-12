@@ -1,6 +1,11 @@
 /**
  * Anthropic Messages API compatibility module.
  * Converts between Anthropic Messages API format and internal ChatCompletionRequest.
+ *
+ * Inbound: Anthropic content blocks (text, image, tool_use, tool_result, thinking)
+ *          → OpenAI ChatMessage format (with tool_calls and tool role messages).
+ * Outbound: OpenAI ChatCompletion response → Anthropic Messages API response
+ *           (text + tool_use content blocks).
  */
 
 import { z } from "zod";
@@ -66,6 +71,62 @@ function anthropicSystemToString(system: unknown): string {
   return String(system);
 }
 
+interface RawContentBlock {
+  type: string;
+  [key: string]: unknown;
+}
+
+interface OpenAIToolCall {
+  id: string;
+  type: "function";
+  function: { name: string; arguments: string };
+}
+
+interface ToolResultItem {
+  tool_call_id: string;
+  content: string;
+}
+
+/** Extract OpenAI-compatible tool_calls from Anthropic tool_use content blocks. */
+function extractToolCalls(content: unknown): OpenAIToolCall[] | undefined {
+  if (!Array.isArray(content)) return undefined;
+  const calls: OpenAIToolCall[] = [];
+  for (const block of content) {
+    if (typeof block !== "object" || block === null) continue;
+    const b = block as Record<string, unknown>;
+    if (b.type !== "tool_use") continue;
+    calls.push({
+      id: typeof b.id === "string" ? b.id : `toolu_${calls.length}`,
+      type: "function",
+      function: {
+        name: typeof b.name === "string" ? b.name : "",
+        arguments: typeof b.input === "object" && b.input !== null
+          ? JSON.stringify(b.input)
+          : String(b.input ?? "{}"),
+      },
+    });
+  }
+  return calls.length > 0 ? calls : undefined;
+}
+
+/** Extract tool_result items from user content blocks. */
+function extractToolResults(content: unknown): ToolResultItem[] | undefined {
+  if (!Array.isArray(content)) return undefined;
+  const results: ToolResultItem[] = [];
+  for (const block of content) {
+    if (typeof block !== "object" || block === null) continue;
+    const b = block as Record<string, unknown>;
+    if (b.type !== "tool_result") continue;
+    const tcId = typeof b.tool_use_id === "string" ? b.tool_use_id : "unknown";
+    const resultContent =
+      typeof b.content === "string"
+        ? b.content
+        : JSON.stringify(b.content ?? "");
+    results.push({ tool_call_id: tcId, content: resultContent });
+  }
+  return results.length > 0 ? results : undefined;
+}
+
 function anthropicContentToChatContent(content: unknown): unknown {
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) return String(content ?? "");
@@ -86,6 +147,10 @@ function anthropicContentToChatContent(content: unknown): unknown {
           image_url: { url: `data:${mediaType};base64,${data}` },
         });
       }
+    } else if (b.type === "thinking") {
+      parts.push({ type: "text", text: String(b.thinking ?? "") });
+    } else if (b.type === "tool_use" || b.type === "tool_result") {
+      // extracted separately via extractToolCalls / extractToolResults
     }
   }
 
@@ -104,10 +169,34 @@ export function anthropicRequestToChatRequest(req: AnthropicMessagesRequest): Ch
   }
 
   for (const msg of req.messages) {
-    messages.push({
-      role: msg.role as ChatMessage["role"],
-      content: anthropicContentToChatContent(msg.content),
-    });
+    if (msg.role === "assistant") {
+      const toolCalls = extractToolCalls(msg.content);
+      const chatMsg: ChatMessage = {
+        role: "assistant",
+        content: anthropicContentToChatContent(msg.content),
+      };
+      if (toolCalls) {
+        (chatMsg as Record<string, unknown>).tool_calls = toolCalls;
+      }
+      messages.push(chatMsg);
+    } else {
+      // user role: extract tool_results as separate tool messages
+      const toolResults = extractToolResults(msg.content);
+      messages.push({
+        role: "user",
+        content: anthropicContentToChatContent(msg.content),
+      });
+      if (toolResults) {
+        for (const tr of toolResults) {
+          messages.push({
+            role: "tool",
+            content: tr.content,
+          } as ChatMessage & { tool_call_id?: string });
+          const last = messages[messages.length - 1] as Record<string, unknown>;
+          last.tool_call_id = tr.tool_call_id;
+        }
+      }
+    }
   }
 
   return {
@@ -122,13 +211,23 @@ export function anthropicRequestToChatRequest(req: AnthropicMessagesRequest): Ch
 // Response conversion: internal -> Anthropic Messages format
 // ─────────────────────────────────────────────────────────────────────────────
 
+export interface AnthropicContentBlock {
+  type: "text" | "tool_use" | "thinking";
+  text?: string;
+  id?: string;
+  name?: string;
+  input?: Record<string, unknown>;
+  thinking?: string;
+  signature?: string;
+}
+
 export interface AnthropicMessagesResponse {
   id: string;
   type: "message";
   role: "assistant";
-  content: Array<{ type: "text"; text: string }>;
+  content: AnthropicContentBlock[];
   model: string;
-  stop_reason: "end_turn" | "max_tokens" | "stop_sequence" | null;
+  stop_reason: "end_turn" | "max_tokens" | "stop_sequence" | "tool_use" | null;
   stop_sequence: string | null;
   usage: { input_tokens: number; output_tokens: number };
 }
@@ -137,12 +236,37 @@ export function chatCompletionToAnthropicResponse(
   chat: Record<string, unknown>,
   requestModel: string
 ): AnthropicMessagesResponse {
-  let text = "";
+  const content: AnthropicContentBlock[] = [];
   const choices = (chat.choices as unknown[]) ?? [];
+  let message: Record<string, unknown> = {};
+
   if (choices.length > 0) {
     const first = choices[0] as Record<string, unknown>;
-    const message = (first.message as Record<string, unknown>) ?? {};
-    text = normalizeMessageContent(message.content);
+    message = (first.message as Record<string, unknown>) ?? {};
+    const text = normalizeMessageContent(message.content);
+    if (text) {
+      content.push({ type: "text", text });
+    }
+  }
+
+  // Extract tool_calls and convert to tool_use blocks
+  const toolCalls = message.tool_calls as Array<Record<string, unknown>> | undefined;
+  if (toolCalls && Array.isArray(toolCalls)) {
+    for (const tc of toolCalls) {
+      const fn = tc.function as Record<string, unknown> | undefined;
+      let input: Record<string, unknown> = {};
+      if (typeof fn?.arguments === "string") {
+        try { input = JSON.parse(fn.arguments) as Record<string, unknown>; } catch { /* keep empty */ }
+      } else if (typeof fn?.arguments === "object" && fn?.arguments !== null) {
+        input = fn.arguments as Record<string, unknown>;
+      }
+      content.push({
+        type: "tool_use",
+        id: typeof tc.id === "string" ? tc.id : `toolu_${content.length}`,
+        name: typeof fn?.name === "string" ? fn.name : "",
+        input,
+      });
+    }
   }
 
   let inputTokens = 0;
@@ -154,15 +278,16 @@ export function chatCompletionToAnthropicResponse(
   }
 
   const finishReason = (choices[0] as Record<string, unknown>)?.finish_reason;
-  let stopReason: "end_turn" | "max_tokens" | "stop_sequence" | null = "end_turn";
-  if (finishReason === "length") stopReason = "max_tokens";
+  let stopReason: "end_turn" | "max_tokens" | "stop_sequence" | "tool_use" | null = "end_turn";
+  if (finishReason === "tool_calls") stopReason = "tool_use";
+  else if (finishReason === "length") stopReason = "max_tokens";
   else if (finishReason === "stop") stopReason = "end_turn";
 
   return {
     id: `msg_${randomUUID().replace(/-/g, "").slice(0, 24)}`,
     type: "message",
     role: "assistant",
-    content: [{ type: "text", text }],
+    content: content.length > 0 ? content : [{ type: "text", text: "" }],
     model: requestModel,
     stop_reason: stopReason,
     stop_sequence: null,
@@ -200,11 +325,34 @@ export function anthropicStreamContentBlockStart(index: number): string {
   })}\n\n`;
 }
 
+export function anthropicStreamContentBlockStartForToolUse(
+  index: number,
+  id: string,
+  name: string
+): string {
+  return `event: content_block_start\ndata: ${JSON.stringify({
+    type: "content_block_start",
+    index,
+    content_block: { type: "tool_use", id, name, input: {} },
+  })}\n\n`;
+}
+
 export function anthropicStreamContentBlockDelta(index: number, text: string): string {
   return `event: content_block_delta\ndata: ${JSON.stringify({
     type: "content_block_delta",
     index,
     delta: { type: "text_delta", text },
+  })}\n\n`;
+}
+
+export function anthropicStreamContentBlockDeltaForToolUse(
+  index: number,
+  partialJson: string
+): string {
+  return `event: content_block_delta\ndata: ${JSON.stringify({
+    type: "content_block_delta",
+    index,
+    delta: { type: "input_json_delta", partial_json: partialJson },
   })}\n\n`;
 }
 
@@ -216,7 +364,7 @@ export function anthropicStreamContentBlockStop(index: number): string {
 }
 
 export function anthropicStreamMessageDelta(
-  stopReason: "end_turn" | "max_tokens" | "stop_sequence",
+  stopReason: "end_turn" | "max_tokens" | "stop_sequence" | "tool_use",
   outputTokens: number
 ): string {
   return `event: message_delta\ndata: ${JSON.stringify({

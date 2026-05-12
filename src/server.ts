@@ -43,7 +43,9 @@ import {
   chatCompletionToAnthropicResponse,
   anthropicStreamMessageStart,
   anthropicStreamContentBlockStart,
+  anthropicStreamContentBlockStartForToolUse,
   anthropicStreamContentBlockDelta,
+  anthropicStreamContentBlockDeltaForToolUse,
   anthropicStreamContentBlockStop,
   anthropicStreamMessageDelta,
   anthropicStreamMessageStop,
@@ -705,12 +707,21 @@ async function handleAnthropicMessages(c: Context): Promise<Response> {
   const anthropicStream = new ReadableStream({
     async start(controller) {
       controller.enqueue(encoder.encode(anthropicStreamMessageStart(messageId, requestModel, 0)));
-      controller.enqueue(encoder.encode(anthropicStreamContentBlockStart(0)));
       controller.enqueue(encoder.encode(anthropicStreamPing()));
 
       const reader = upstreamResponse.body!.getReader();
       let buffer = "";
       let outputTokens = 0;
+      let textBlockStarted = false;
+      const toolBlocksStarted = new Set<number>();
+      let finishReasonSeen: string | null = null;
+
+      const ensureTextBlock = () => {
+        if (!textBlockStarted) {
+          textBlockStarted = true;
+          controller.enqueue(encoder.encode(anthropicStreamContentBlockStart(0)));
+        }
+      };
 
       try {
         while (true) {
@@ -741,11 +752,43 @@ async function handleAnthropicMessages(c: Context): Promise<Response> {
             const content = delta?.content;
 
             if (typeof content === "string" && content) {
+              ensureTextBlock();
               controller.enqueue(encoder.encode(anthropicStreamContentBlockDelta(0, content)));
               outputTokens += Math.ceil(content.length / 4);
             }
 
+            // tool_calls delta: emit tool_use content blocks
+            const deltaToolCalls = delta?.tool_calls as Array<Record<string, unknown>> | undefined;
+            if (deltaToolCalls && Array.isArray(deltaToolCalls)) {
+              for (const tc of deltaToolCalls) {
+                if (typeof tc !== "object" || tc === null) continue;
+                const tcIndex = typeof tc.index === "number" ? tc.index : 0;
+                const blockIdx = textBlockStarted ? tcIndex + 1 : tcIndex;
+
+                if (!toolBlocksStarted.has(blockIdx)) {
+                  toolBlocksStarted.add(blockIdx);
+                  const fn = tc.function as Record<string, unknown> | undefined;
+                  controller.enqueue(encoder.encode(
+                    anthropicStreamContentBlockStartForToolUse(
+                      blockIdx,
+                      typeof tc.id === "string" ? tc.id : `toolu_${blockIdx}`,
+                      typeof fn?.name === "string" ? fn.name : ""
+                    )
+                  ));
+                }
+
+                const fn = tc.function as Record<string, unknown> | undefined;
+                const args = fn?.arguments;
+                if (typeof args === "string" && args) {
+                  controller.enqueue(encoder.encode(
+                    anthropicStreamContentBlockDeltaForToolUse(blockIdx, args)
+                  ));
+                }
+              }
+            }
+
             if (choice.finish_reason) {
+              finishReasonSeen = choice.finish_reason as string;
               break;
             }
           }
@@ -754,8 +797,18 @@ async function handleAnthropicMessages(c: Context): Promise<Response> {
         logger.error({ err: e }, "Anthropic stream proxy error");
       }
 
-      controller.enqueue(encoder.encode(anthropicStreamContentBlockStop(0)));
-      controller.enqueue(encoder.encode(anthropicStreamMessageDelta("end_turn", outputTokens)));
+      if (textBlockStarted) {
+        controller.enqueue(encoder.encode(anthropicStreamContentBlockStop(0)));
+      }
+      for (const idx of toolBlocksStarted) {
+        controller.enqueue(encoder.encode(anthropicStreamContentBlockStop(idx)));
+      }
+
+      const stopReason =
+        finishReasonSeen === "tool_calls" ? "tool_use"
+        : finishReasonSeen === "length" ? "max_tokens"
+        : "end_turn";
+      controller.enqueue(encoder.encode(anthropicStreamMessageDelta(stopReason, outputTokens)));
       controller.enqueue(encoder.encode(anthropicStreamMessageStop()));
       controller.close();
     },
