@@ -52,6 +52,7 @@ import {
   anthropicStreamPing,
   anthropicErrorResponse,
 } from "./lib/anthropic-compat.js";
+import { createResponsesStreamFromChatCompletion } from "./lib/responses-compat.js";
 import { closeAll } from "./lib/http-client.js";
 import { iterCodexEvents, collectCodexTextAndUsageFromEvents } from "./providers/codex-cli.js";
 import {
@@ -564,12 +565,54 @@ async function handleResponses(c: Context): Promise<Response> {
   if (!chatReq.messages.length) {
     return openaiError("Missing input for responses request", 422);
   }
+
   if (chatReq.stream) {
-    return openaiError(
-      "Streaming responses are not supported; set stream=false or use /v1/chat/completions",
-      400
+    chatReq.stream = true;
+    const sseResponse = await handleChatCompletions(
+      chatReq,
+      c.req.header("authorization") ?? undefined,
+      c
     );
+
+    const upstreamResponse =
+      sseResponse instanceof Response
+        ? sseResponse
+        : new Response(JSON.stringify(chatCompletionToResponses(sseResponse as Record<string, unknown>)), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+
+    if (upstreamResponse.status >= 400) {
+      const errBody = await upstreamResponse.text().catch(() => "Internal error");
+      return openaiError(errBody, upstreamResponse.status || 500);
+    }
+
+    const contentType = upstreamResponse.headers.get("content-type") ?? "";
+    if (!contentType.includes("text/event-stream") || !upstreamResponse.body) {
+      try {
+        const json = (await upstreamResponse.json()) as Record<string, unknown>;
+        if (json?.object === "chat.completion") {
+          return c.json(chatCompletionToResponses(json));
+        }
+        return c.json(json);
+      } catch {
+        return openaiError("Expected streaming response from upstream", 500);
+      }
+    }
+
+    const responseModel = (req.model ?? chatReq.model ?? settings.default_model ?? "auto").trim() || "auto";
+    const responsesStream = createResponsesStreamFromChatCompletion(upstreamResponse.body, responseModel);
+    const headers = new Headers({
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+    });
+    for (const [k, v] of Object.entries(extractCodexUsageHeaders(upstreamResponse.headers))) {
+      headers.set(k, v);
+    }
+    return new Response(responsesStream, { headers });
   }
+
   const result = await handleChatCompletions(chatReq, c.req.header("authorization") ?? undefined, c);
   if (result instanceof Response) {
     if (result.status < 400) {
