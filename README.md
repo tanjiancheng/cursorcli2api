@@ -68,18 +68,48 @@ npm run doctor
 
 ```bash
 cp .env.example .env
-# 编辑 .env 设置 CODEX_GATEWAY_TOKEN 等
+# 编辑 .env，至少设置 CODEX_GATEWAY_TOKEN
 ```
+
+推荐 `.env` 示例（Cursor Agent 场景）：
+
+```env
+# ===== Gateway =====
+CODEX_GATEWAY_HOST=0.0.0.0
+CODEX_GATEWAY_PORT=8000
+CODEX_GATEWAY_TOKEN=sk-your-gateway-token
+
+# ===== Provider =====
+CODEX_PROVIDER=cursor-agent
+CODEX_PRESET=cursor-auto
+
+# ===== Cursor Agent =====
+CURSOR_AGENT_BIN=cursor-agent
+CURSOR_AGENT_WORKSPACE=/tmp/cursor-empty-workspace
+CURSOR_AGENT_MODEL=auto
+CURSOR_AGENT_STREAM_PARTIAL_OUTPUT=true
+CURSOR_AGENT_DISABLE_INDEXING=true
+
+# ===== Models =====
+CODEX_ADVERTISED_MODELS=auto,composer-2.5-fast
+CODEX_ALLOW_CLIENT_MODEL_OVERRIDE=true
+
+# ===== Limits =====
+CODEX_MAX_CONCURRENCY=100
+CODEX_TIMEOUT_SECONDS=600
+CODEX_SSE_KEEPALIVE_SECONDS=2
+
+# ===== Logging =====
+CODEX_LOG_MODE=summary
+CODEX_LOG_EVENTS=true
+```
+
+`npm run dev` / `npm start` 已默认附带 `--auto-env`，会自动加载当前目录下的 `.env`。
 
 ### 4. 启动
 
 ```bash
-# 开发模式（Cursor Agent）
-npm run dev -- cursor-agent --host 0.0.0.0
-
-# 指定模型和 token
-CODEX_GATEWAY_TOKEN=sk-your-key \
-CODEX_ADVERTISED_MODELS="auto,gpt-5.4-medium,claude-4.6-sonnet-medium" \
+# 开发模式（自动加载 .env）
 npm run dev -- cursor-agent --host 0.0.0.0
 
 # 生产模式
@@ -100,7 +130,6 @@ npm test
 ```
 
 服务启动后可通过 `Ctrl+C` 优雅关闭 — 停止接受新请求后等待活跃请求完成，然后清理连接池退出。
-```
 
 ## 流式 vs 非流式
 
@@ -223,20 +252,22 @@ Cursor Agent 通过**提示工程**实现了 OpenAI 标准 function calling：
 
 ## 环境变量
 
-详见 [`.env.example`](.env.example)，关键变量：
+完整模板见 [`.env.example`](.env.example)。常用变量：
 
 | 变量 | 默认值 | 描述 |
 |------|--------|------|
 | `CODEX_GATEWAY_TOKEN` | — | Bearer Token 鉴权（空=无鉴权） |
 | `CODEX_PROVIDER` | `auto` | Provider: `cursor-agent`/`codex`/`claude`/`gemini` |
-| `CODEX_PRESET` | — | 预设名 |
+| `CODEX_PRESET` | — | 预设名（如 `cursor-auto`） |
 | `CURSOR_AGENT_BIN` | `cursor-agent` | CLI 路径 |
 | `CURSOR_AGENT_WORKSPACE` | — | 工作目录（建议 `/tmp/cursor-empty-workspace`） |
-| `CURSOR_AGENT_API_KEY` | — | Cursor API Key |
-| `CURSOR_AGENT_MODEL` | — | 默认模型 |
+| `CURSOR_AGENT_API_KEY` | — | Cursor API Key（也可用 `cursor-agent login`） |
+| `CURSOR_AGENT_MODEL` | — | 默认模型（如 `auto`） |
 | `CODEX_ADVERTISED_MODELS` | — | `/v1/models` 返回的模型列表 |
+| `CODEX_ALLOW_CLIENT_MODEL_OVERRIDE` | `false` | 允许客户端覆盖模型 |
 | `CODEX_MAX_CONCURRENCY` | `100` | 最大并发 |
 | `CODEX_TIMEOUT_SECONDS` | `600` | 请求超时 |
+| `CODEX_LOG_MODE` | — | 日志模式：`summary` / `qa` |
 
 ## Provider 路由
 
@@ -301,6 +332,7 @@ cursorcli2api/
 │   ├── lib/
 │   │   ├── openai-compat.ts    # OpenAI 格式转换 + Tool Call
 │   │   ├── anthropic-compat.ts # Anthropic 格式转换
+│   │   ├── responses-compat.ts # Responses API 流式转换
 │   │   └── http-client.ts      # HTTP 客户端
 │   ├── providers/
 │   │   ├── stream-json-cli.ts  # NDJSON 流解析器
@@ -311,6 +343,7 @@ cursorcli2api/
 │   └── codex_instructions/     # 系统指令模板
 ├── tests/
 │   ├── openai-compat.test.ts    # OpenAI 兼容层测试
+│   ├── responses-compat.test.ts # Responses API 流式测试
 │   ├── claude-oauth.test.ts     # Claude OAuth 测试
 │   └── stream-json-cli.test.ts  # 子进程生命周期测试
 └── dist/                       # 编译输出
