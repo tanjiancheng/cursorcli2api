@@ -173,6 +173,24 @@ test("inbound plain text messages pass through unchanged", () => {
   assert.equal(chat.messages[1].content, "hi there");
 });
 
+test("inbound system role in messages array", () => {
+  const req: AnthropicMessagesRequest = {
+    model: "auto",
+    messages: [
+      { role: "system", content: "You are helpful" },
+      { role: "user", content: "hello" },
+    ],
+    max_tokens: 100,
+  };
+
+  const chat = anthropicRequestToChatRequest(req);
+
+  assert.equal(chat.messages.length, 2);
+  assert.equal(chat.messages[0].role, "system");
+  assert.equal(chat.messages[0].content, "You are helpful");
+  assert.equal(chat.messages[1].role, "user");
+});
+
 test("inbound with system prompt", () => {
   const req: AnthropicMessagesRequest = {
     model: "claude:sonnet",

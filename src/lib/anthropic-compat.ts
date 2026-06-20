@@ -30,7 +30,7 @@ const AnthropicContentBlockSchema = z.union([
 
 const AnthropicMessageSchema = z
   .object({
-    role: z.enum(["user", "assistant"]),
+    role: z.enum(["user", "assistant", "system"]),
     content: AnthropicContentBlockSchema,
   })
   .passthrough();
@@ -160,15 +160,34 @@ function anthropicContentToChatContent(content: unknown): unknown {
   return parts.length > 0 ? parts : "";
 }
 
+function anthropicMessageContentToString(content: unknown): string {
+  if (typeof content === "string") return content;
+  const chatContent = anthropicContentToChatContent(content);
+  if (typeof chatContent === "string") return chatContent;
+  if (Array.isArray(chatContent)) {
+    return chatContent
+      .filter((part): part is Record<string, unknown> => typeof part === "object" && part !== null)
+      .map((part) => (part.type === "text" ? String(part.text ?? "") : ""))
+      .filter(Boolean)
+      .join("\n");
+  }
+  return String(chatContent ?? "");
+}
+
 export function anthropicRequestToChatRequest(req: AnthropicMessagesRequest): ChatCompletionRequest {
   const messages: ChatMessage[] = [];
+  const systemParts: string[] = [];
 
   const systemText = anthropicSystemToString(req.system);
-  if (systemText.trim()) {
-    messages.push({ role: "system", content: systemText });
-  }
+  if (systemText.trim()) systemParts.push(systemText);
 
   for (const msg of req.messages) {
+    if (msg.role === "system") {
+      const text = anthropicMessageContentToString(msg.content);
+      if (text.trim()) systemParts.push(text);
+      continue;
+    }
+
     if (msg.role === "assistant") {
       const toolCalls = extractToolCalls(msg.content);
       const chatMsg: ChatMessage = {
@@ -197,6 +216,10 @@ export function anthropicRequestToChatRequest(req: AnthropicMessagesRequest): Ch
         }
       }
     }
+  }
+
+  if (systemParts.length > 0) {
+    messages.unshift({ role: "system", content: systemParts.join("\n\n") });
   }
 
   return {
