@@ -296,6 +296,23 @@ function logAuthFailure(reason: string, ctx?: AuthLogContext): void {
   );
 }
 
+function resolveBearerAuth(sources: {
+  authorization?: string | null;
+  queryKey?: string | null;
+  xGoogApiKey?: string | null;
+  xApiKey?: string | null;
+}): string | null | undefined {
+  const authHeader = sources.authorization?.trim();
+  if (authHeader) return authHeader;
+  const queryKey = sources.queryKey?.trim();
+  if (queryKey) return `Bearer ${queryKey}`;
+  const googKey = sources.xGoogApiKey?.trim();
+  if (googKey) return `Bearer ${googKey}`;
+  const xApiKey = sources.xApiKey?.trim();
+  if (xApiKey) return `Bearer ${xApiKey}`;
+  return null;
+}
+
 function checkAuth(authorization: string | null | undefined, ctx?: AuthLogContext): void {
   const token = settings.bearer_token;
   if (!token) return;
@@ -957,7 +974,11 @@ async function handleGeminiModelsRoute(c: Context): Promise<Response> {
   const googApiKey = c.req.header("x-goog-api-key");
   try {
     checkAuth(
-      apiKey ? `Bearer ${apiKey}` : authHeader,
+      resolveBearerAuth({
+        authorization: authHeader,
+        queryKey: apiKey,
+        xGoogApiKey: googApiKey,
+      }),
       authLogContext(c, {
         hasAuthorization: !!authHeader,
         hasQueryKey: !!apiKey,
