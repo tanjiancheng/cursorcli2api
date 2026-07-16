@@ -52,6 +52,15 @@ import {
   anthropicStreamPing,
   anthropicErrorResponse,
 } from "./lib/anthropic-compat.js";
+import {
+  GeminiGenerateContentRequestSchema,
+  geminiRequestToChatRequest,
+  chatCompletionToGeminiResponse,
+  geminiStreamTextChunk,
+  geminiStreamToolCallChunk,
+  geminiStreamFinalChunk,
+  geminiErrorResponse,
+} from "./lib/gemini-compat.js";
 import { createResponsesStreamFromChatCompletion } from "./lib/responses-compat.js";
 import { closeAll } from "./lib/http-client.js";
 import { iterCodexEvents, collectCodexTextAndUsageFromEvents } from "./providers/codex-cli.js";
@@ -652,6 +661,14 @@ app.post("/chat/completions", handleChatCompletionsRoute);
 app.post("/v1/messages", handleAnthropicMessages);
 app.post("/messages", handleAnthropicMessages);
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Gemini generateContent API
+// ─────────────────────────────────────────────────────────────────────────────
+
+app.post("/v1/models/*", handleGeminiModelsRoute);
+app.post("/v1beta/models/*", handleGeminiModelsRoute);
+app.post("/models/*", handleGeminiModelsRoute);
+
 async function handleChatCompletionsRoute(c: Context): Promise<Response> {
   try {
     checkAuth(c.req.header("authorization"));
@@ -858,6 +875,198 @@ async function handleAnthropicMessages(c: Context): Promise<Response> {
   });
 
   return new Response(anthropicStream, {
+    headers: {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+    },
+  });
+}
+
+async function handleGeminiModelsRoute(c: Context): Promise<Response> {
+  const path = c.req.path;
+  const modelsIdx = path.indexOf("/models/");
+  if (modelsIdx === -1) {
+    return geminiErrorResponse("Invalid path", 404);
+  }
+  const modelAction = decodeURIComponent(path.slice(modelsIdx + "/models/".length));
+  const colonIdx = modelAction.lastIndexOf(":");
+  if (colonIdx === -1) {
+    return geminiErrorResponse("Invalid path: missing action", 404);
+  }
+  const model = modelAction.slice(0, colonIdx);
+  const action = modelAction.slice(colonIdx + 1);
+
+  if (action !== "generateContent" && action !== "streamGenerateContent") {
+    return geminiErrorResponse(`Unsupported action: ${action}`, 404);
+  }
+
+  const isStream = action === "streamGenerateContent";
+
+  const apiKey = c.req.query("key");
+  const authHeader = c.req.header("authorization");
+  try {
+    checkAuth(apiKey ? `Bearer ${apiKey}` : authHeader);
+  } catch (e) {
+    return geminiErrorResponse(String(e), 401);
+  }
+
+  let body: unknown;
+  try {
+    body = await c.req.json();
+  } catch {
+    return geminiErrorResponse("Invalid JSON body", 400);
+  }
+
+  const parsed = GeminiGenerateContentRequestSchema.safeParse(body);
+  if (!parsed.success) {
+    return geminiErrorResponse(
+      "Invalid request: " + (parsed.error.message ?? "validation failed"),
+      400
+    );
+  }
+
+  const geminiReq = parsed.data;
+  const chatReq = geminiRequestToChatRequest(geminiReq, model, isStream);
+
+  if (!isStream) {
+    chatReq.stream = false;
+    const result = await handleChatCompletions(chatReq, authHeader ?? undefined, c);
+    let chatJson: Record<string, unknown>;
+    if (result instanceof Response) {
+      if (result.status >= 400) {
+        const errBody = await result.text().catch(() => "Internal error");
+        return geminiErrorResponse(errBody, result.status);
+      }
+      chatJson = (await result.json()) as Record<string, unknown>;
+    } else {
+      chatJson = result;
+    }
+    const geminiResp = chatCompletionToGeminiResponse(chatJson, model);
+    return new Response(JSON.stringify(geminiResp), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  // Streaming: get SSE from OpenAI-format handler, re-encode as Gemini SSE
+  chatReq.stream = true;
+  const sseResponse = await handleChatCompletions(chatReq, authHeader ?? undefined, c);
+  const upstreamResponse =
+    sseResponse instanceof Response
+      ? sseResponse
+      : new Response(JSON.stringify(sseResponse), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+
+  if (upstreamResponse.status >= 400 || !upstreamResponse.body) {
+    const errBody = await upstreamResponse.text().catch(() => "Internal error");
+    return geminiErrorResponse(errBody, upstreamResponse.status || 500);
+  }
+
+  const contentType = upstreamResponse.headers.get("content-type") ?? "";
+  if (!contentType.includes("text/event-stream")) {
+    try {
+      const json = (await upstreamResponse.json()) as Record<string, unknown>;
+      if (json?.object === "chat.completion") {
+        return new Response(
+          JSON.stringify(chatCompletionToGeminiResponse(json, model)),
+          { status: 200, headers: { "Content-Type": "application/json" } }
+        );
+      }
+      return new Response(JSON.stringify(json), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    } catch {
+      return geminiErrorResponse("Expected streaming response from upstream", 500);
+    }
+  }
+
+  const geminiEncoder = new TextEncoder();
+  const geminiDecoder = new TextDecoder();
+
+  const geminiStream = new ReadableStream({
+    async start(controller) {
+      const reader = upstreamResponse.body!.getReader();
+      let buffer = "";
+      let outputTokens = 0;
+      let finishReasonSeen: string | null = null;
+
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += geminiDecoder.decode(value, { stream: true });
+
+          const lines = buffer.split("\n");
+          buffer = lines.pop() ?? "";
+
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed.startsWith("data: ")) continue;
+            const payload = trimmed.slice(6);
+            if (payload === "[DONE]") continue;
+
+            let chunk: Record<string, unknown>;
+            try {
+              chunk = JSON.parse(payload) as Record<string, unknown>;
+            } catch {
+              continue;
+            }
+
+            const choices = chunk.choices as Array<Record<string, unknown>> | undefined;
+            if (!choices?.length) continue;
+            const choice = choices[0];
+            const delta = choice.delta as Record<string, unknown> | undefined;
+
+            const content = delta?.content;
+            if (typeof content === "string" && content) {
+              controller.enqueue(
+                geminiEncoder.encode(geminiStreamTextChunk(content, model))
+              );
+              outputTokens += Math.ceil(content.length / 4);
+            }
+
+            const deltaToolCalls = delta?.tool_calls as
+              | Array<Record<string, unknown>>
+              | undefined;
+            if (deltaToolCalls && Array.isArray(deltaToolCalls) && deltaToolCalls.length > 0) {
+              controller.enqueue(
+                geminiEncoder.encode(geminiStreamToolCallChunk(deltaToolCalls, model))
+              );
+            }
+
+            if (choice.finish_reason) {
+              finishReasonSeen = choice.finish_reason as string;
+            }
+          }
+        }
+      } catch (e) {
+        logger.error({ err: e }, "Gemini stream proxy error");
+      }
+
+      const geminiFinish =
+        finishReasonSeen === "length" ? "MAX_TOKENS" : "STOP";
+      controller.enqueue(
+        geminiEncoder.encode(
+          geminiStreamFinalChunk(
+            geminiFinish,
+            {
+              promptTokenCount: 0,
+              candidatesTokenCount: outputTokens,
+              totalTokenCount: outputTokens,
+            },
+            model
+          )
+        )
+      );
+      controller.close();
+    },
+  });
+
+  return new Response(geminiStream, {
     headers: {
       "Content-Type": "text/event-stream",
       "Cache-Control": "no-cache",
