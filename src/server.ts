@@ -255,14 +255,57 @@ function truncateForLog(text: string): string {
   return `${text.slice(0, limit)}\n... (truncated, ${text.length} chars total)`;
 }
 
-function checkAuth(authorization: string | null | undefined): void {
+interface AuthLogContext {
+  path: string;
+  method?: string;
+  remoteAddr?: string | null;
+  hasAuthorization?: boolean;
+  hasQueryKey?: boolean;
+  hasXApiKey?: boolean;
+  hasXGoogApiKey?: boolean;
+}
+
+function authLogContext(c: Context, extras?: Partial<AuthLogContext>): AuthLogContext {
+  return {
+    path: c.req.path,
+    method: c.req.method,
+    remoteAddr: c.req.header("x-forwarded-for") ?? c.req.header("x-real-ip") ?? null,
+    ...extras,
+  };
+}
+
+function logAuthFailure(reason: string, ctx?: AuthLogContext): void {
+  if (!ctx) {
+    logger.warn({ reason }, "auth failed");
+    return;
+  }
+  logger.warn(
+    {
+      reason,
+      path: ctx.path,
+      method: ctx.method,
+      remoteAddr: ctx.remoteAddr,
+      hasAuthorization: ctx.hasAuthorization ?? false,
+      hasQueryKey: ctx.hasQueryKey ?? false,
+      hasXApiKey: ctx.hasXApiKey ?? false,
+      hasXGoogApiKey: ctx.hasXGoogApiKey ?? false,
+    },
+    "auth failed path=%s reason=%s",
+    ctx.path,
+    reason
+  );
+}
+
+function checkAuth(authorization: string | null | undefined, ctx?: AuthLogContext): void {
   const token = settings.bearer_token;
   if (!token) return;
   if (!authorization || !authorization.startsWith("Bearer ")) {
+    logAuthFailure("missing_bearer_token", ctx);
     throw new Error("Missing Authorization: Bearer <token>");
   }
   const provided = authorization.replace(/^Bearer\s+/, "").trim();
   if (provided !== token) {
+    logAuthFailure("invalid_token", ctx);
     throw new Error("Invalid token");
   }
 }
@@ -445,7 +488,7 @@ app.get("/healthz", (c) => c.json({ ok: true }));
 
 app.get("/v1/models", async (c) => {
   try {
-    checkAuth(c.req.header("authorization"));
+    checkAuth(c.req.header("authorization"), authLogContext(c, { hasAuthorization: !!c.req.header("authorization") }));
   } catch (e) {
     return c.json({ error: { message: String(e) } }, 401);
   }
@@ -472,7 +515,7 @@ app.get("/v1/models", async (c) => {
 
 app.get("/models", async (c) => {
   try {
-    checkAuth(c.req.header("authorization"));
+    checkAuth(c.req.header("authorization"), authLogContext(c, { hasAuthorization: !!c.req.header("authorization") }));
   } catch (e) {
     return c.json({ error: { message: String(e) } }, 401);
   }
@@ -499,7 +542,7 @@ app.get("/models", async (c) => {
 
 app.get("/debug/config", async (c) => {
   try {
-    checkAuth(c.req.header("authorization"));
+    checkAuth(c.req.header("authorization"), authLogContext(c, { hasAuthorization: !!c.req.header("authorization") }));
   } catch (e) {
     return c.json({ error: { message: String(e) } }, 401);
   }
@@ -555,7 +598,7 @@ app.post("/responses", handleResponses);
 
 async function handleResponses(c: Context): Promise<Response> {
   try {
-    checkAuth(c.req.header("authorization"));
+    checkAuth(c.req.header("authorization"), authLogContext(c, { hasAuthorization: !!c.req.header("authorization") }));
   } catch (e) {
     return c.json({ error: { message: String(e) } }, 401);
   }
@@ -671,7 +714,7 @@ app.post("/models/*", handleGeminiModelsRoute);
 
 async function handleChatCompletionsRoute(c: Context): Promise<Response> {
   try {
-    checkAuth(c.req.header("authorization"));
+    checkAuth(c.req.header("authorization"), authLogContext(c, { hasAuthorization: !!c.req.header("authorization") }));
   } catch (e) {
     return c.json({ error: { message: String(e) } }, 401);
   }
@@ -699,7 +742,13 @@ async function handleAnthropicMessages(c: Context): Promise<Response> {
   const apiKey = c.req.header("x-api-key");
   const authHeader = c.req.header("authorization");
   try {
-    checkAuth(apiKey ? `Bearer ${apiKey}` : authHeader);
+    checkAuth(
+      apiKey ? `Bearer ${apiKey}` : authHeader,
+      authLogContext(c, {
+        hasAuthorization: !!authHeader,
+        hasXApiKey: !!apiKey,
+      })
+    );
   } catch (e) {
     return anthropicErrorResponse(String(e), 401);
   }
@@ -905,8 +954,16 @@ async function handleGeminiModelsRoute(c: Context): Promise<Response> {
 
   const apiKey = c.req.query("key");
   const authHeader = c.req.header("authorization");
+  const googApiKey = c.req.header("x-goog-api-key");
   try {
-    checkAuth(apiKey ? `Bearer ${apiKey}` : authHeader);
+    checkAuth(
+      apiKey ? `Bearer ${apiKey}` : authHeader,
+      authLogContext(c, {
+        hasAuthorization: !!authHeader,
+        hasQueryKey: !!apiKey,
+        hasXGoogApiKey: !!googApiKey,
+      })
+    );
   } catch (e) {
     return geminiErrorResponse(String(e), 401);
   }
