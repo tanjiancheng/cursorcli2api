@@ -30,10 +30,12 @@ import {
   extractImageUrls,
   messagesToPrompt,
   normalizeMessageContent,
+  normalizeToolingRequest,
   responsesRequestToChatRequest,
   buildToolCallSystemPrompt,
   formatToolResultMessages,
   parseToolCallResponse,
+  ToolCallStreamFilter,
 } from "./lib/openai-compat.js";
 import { ResponsesRequestSchema } from "./lib/openai-compat.js";
 import { ChatCompletionRequestCompatSchema } from "./lib/openai-compat.js";
@@ -1005,7 +1007,7 @@ async function handleGeminiModelsRoute(c: Context): Promise<Response> {
   }
 
   const geminiReq = parsed.data;
-  const chatReq = geminiRequestToChatRequest(geminiReq, model, isStream);
+  const chatReq = normalizeToolingRequest(geminiRequestToChatRequest(geminiReq, model, isStream));
 
   if (!isStream) {
     chatReq.stream = false;
@@ -1393,11 +1395,6 @@ async function handleChatCompletions(
             if (evt.type === "result" && typeof evt.result === "string") fallbackText = evt.result;
           }
           text = assembler.text || fallbackText || "";
-          if (requestTools && requestTools.length > 0) {
-            const parsed = parseToolCallResponse(text);
-            text = parsed.text;
-            if (parsed.toolCalls) toolCalls = parsed.toolCalls as unknown as Record<string, unknown>[];
-          }
         } else if (provider === "claude") {
           const claudeModel = effectiveProviderModel ?? settings.claude_model ?? "sonnet";
           if (useClaudeOauth) {
@@ -1473,6 +1470,13 @@ async function handleChatCompletions(
       }
 
       text = maybeStripAnswerTags(text).trim();
+
+      if (toolSystemPrompt && !toolCalls?.length) {
+        const parsed = parseToolCallResponse(text);
+        text = parsed.text;
+        if (parsed.toolCalls) toolCalls = parsed.toolCalls as unknown as Record<string, unknown>[];
+      }
+
       const durationMs = Date.now() - t0;
       activeRequests--;
 
@@ -1542,6 +1546,7 @@ async function handleChatCompletions(
             let streamToolCalls: Record<string, unknown>[] | null = null;
             let assembledText = "";
             let sentContent = false;
+            const toolCallFilter = toolSystemPrompt ? new ToolCallStreamFilter() : null;
 
             const attemptModels: (string | null)[] =
               provider === "codex"
@@ -1799,16 +1804,21 @@ async function handleChatCompletions(
                 }
 
                 if (delta) {
-                  sentContent = true;
-                  assembledText += delta;
-                  const chunk = {
-                    id: respId,
-                    object: "chat.completion.chunk",
-                    created,
-                    model: requestedModelForResponse,
-                    choices: [{ index: 0, delta: { content: delta }, finish_reason: null }],
-                  };
-                  safeEnqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+                  if (toolCallFilter) {
+                    delta = toolCallFilter.feed(delta);
+                  }
+                  if (delta) {
+                    sentContent = true;
+                    assembledText += delta;
+                    const chunk = {
+                      id: respId,
+                      object: "chat.completion.chunk",
+                      created,
+                      model: requestedModelForResponse,
+                      choices: [{ index: 0, delta: { content: delta }, finish_reason: null }],
+                    };
+                    safeEnqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+                  }
                 }
               }
 
@@ -1816,11 +1826,21 @@ async function handleChatCompletions(
               break;
             }
 
-            // cursor-agent tool call: check accumulated text for tool call markers at stream end
-            if (provider === "cursor-agent" && requestTools && requestTools.length > 0 && assembledText) {
-              const parsed = parseToolCallResponse(assembledText);
-              if (parsed.toolCalls && parsed.toolCalls.length > 0) {
-                streamToolCalls = parsed.toolCalls as unknown as Record<string, unknown>[];
+            if (toolCallFilter) {
+              const { text: remaining, toolCalls: extracted } = toolCallFilter.flush();
+              if (remaining) {
+                const chunk = {
+                  id: respId,
+                  object: "chat.completion.chunk",
+                  created,
+                  model: requestedModelForResponse,
+                  choices: [{ index: 0, delta: { content: remaining }, finish_reason: null }],
+                };
+                safeEnqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+                assembledText += remaining;
+              }
+              if (extracted && extracted.length > 0 && !streamToolCalls?.length) {
+                streamToolCalls = extracted as unknown as Record<string, unknown>[];
               }
             }
 

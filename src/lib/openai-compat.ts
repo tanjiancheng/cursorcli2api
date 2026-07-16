@@ -549,3 +549,79 @@ function randomCallId(): string {
   for (let i = 0; i < 24; i++) id += chars[Math.floor(Math.random() * chars.length)];
   return id;
 }
+
+/**
+ * Streaming filter that buffers content to detect and strip ___TOOL_CALL___
+ * markers, extracting tool calls without leaking markers to the client.
+ */
+export class ToolCallStreamFilter {
+  private buffer = "";
+  private extracted: ParsedToolCall[] = [];
+
+  feed(delta: string): string {
+    this.buffer += delta;
+    let safe = "";
+
+    while (this.buffer.length > 0) {
+      const idx = this.buffer.indexOf(TOOL_CALL_MARKER);
+
+      if (idx === -1) {
+        let holdBack = 0;
+        for (let i = 1; i < TOOL_CALL_MARKER.length && i <= this.buffer.length; i++) {
+          if (TOOL_CALL_MARKER.startsWith(this.buffer.slice(this.buffer.length - i))) {
+            holdBack = i;
+          }
+        }
+        if (holdBack > 0) {
+          safe += this.buffer.slice(0, this.buffer.length - holdBack);
+          this.buffer = this.buffer.slice(this.buffer.length - holdBack);
+        } else {
+          safe += this.buffer;
+          this.buffer = "";
+        }
+        break;
+      }
+
+      safe += this.buffer.slice(0, idx);
+      const afterFirst = idx + TOOL_CALL_MARKER.length;
+      const closingIdx = this.buffer.indexOf(TOOL_CALL_MARKER, afterFirst);
+
+      if (closingIdx === -1) {
+        this.buffer = this.buffer.slice(idx);
+        break;
+      }
+
+      const between = this.buffer.slice(afterFirst, closingIdx).trim();
+      try {
+        const parsed = JSON.parse(between) as { name?: string; arguments?: unknown };
+        if (parsed.name) {
+          this.extracted.push({
+            id: `call_${randomCallId()}`,
+            type: "function",
+            function: {
+              name: parsed.name,
+              arguments:
+                typeof parsed.arguments === "string"
+                  ? parsed.arguments
+                  : JSON.stringify(parsed.arguments ?? {}),
+            },
+          });
+        }
+      } catch {
+        /* not valid JSON */
+      }
+      this.buffer = this.buffer.slice(closingIdx + TOOL_CALL_MARKER.length);
+    }
+
+    return safe;
+  }
+
+  flush(): { text: string; toolCalls: ParsedToolCall[] | null } {
+    const text = this.buffer.trim();
+    this.buffer = "";
+    return {
+      text,
+      toolCalls: this.extracted.length > 0 ? this.extracted : null,
+    };
+  }
+}
